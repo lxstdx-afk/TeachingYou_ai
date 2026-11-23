@@ -1,0 +1,13 @@
+# Никогда не добавляем локальные секреты в Git.
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+*.pem
+*.key
+
+node_modules/
+.wrangler/
+coverage/
+.DS_Store
+npm-debug.log*
