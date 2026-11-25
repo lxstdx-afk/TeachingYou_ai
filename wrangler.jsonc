@@ -3,5 +3,16 @@
   "name": "teachingyou-ai",
   "main": "./worker.js",
   "compatibility_date": "2026-11-22",
-  "keep_vars": true
+  "keep_vars": true,
+  "ai": {
+    "binding": "AI"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "UPDATE_GUARD", "class_name": "SeenUpdate" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SeenUpdate"] }
+  ]
 }
