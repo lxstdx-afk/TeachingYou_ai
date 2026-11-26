@@ -63,7 +63,7 @@ export function makeHarness({ aiImpl, networkImpl, settings = {} } = {}) {
       const result = await networkImpl(address, options, body, calls);
       if (result) return result;
     }
-    if (address.includes("/sendMessage") || address.includes("/answerCallbackQuery")) return Response.json({ ok: true, result: {} });
+    if (["/sendMessage", "/sendDocument", "/answerCallbackQuery", "/sendChatAction", "/setMyCommands", "/setChatMenuButton"].some((method) => address.endsWith(method))) return Response.json({ ok: true, result: {} });
     if (address.endsWith("/getFile")) return Response.json({ ok: true, result: { file_path: "photos/test.jpg", file_size: 6 } });
     if (address.includes("/file/bot")) return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0x00, 0x12, 0x34]), { headers: { "Content-Type": "image/jpeg" } });
     if (address === "https://api.tavily.com/search") return Response.json({ results: [{ title: "Пример источника", url: "https://example.org/info", content: "Свежие сведения." }] });

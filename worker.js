@@ -1,6 +1,6 @@
 // TeachingYou AI: private Telegram webhook, per-user durable chats and memory.
 // No prompts, file URLs, API keys, or provider errors are written to logs.
-import { extractPhoto, answerCallback, sendReply } from "./src/telegram.js";
+import { extractPhoto, answerCallback, configureMenu, sendReply } from "./src/telegram.js";
 import { UserConversations } from "./src/conversations.js";
 import { SearchBudget } from "./src/search.js";
 export { UserConversations, SearchBudget };
@@ -75,7 +75,11 @@ function getEvent(update, allowed) {
     return { updateId: update.update_id, chatId, kind: "callback", data: callback.data, callbackId: callback.id };
   }
   const text = typeof message?.text === "string" ? message.text : (typeof message?.caption === "string" ? message.caption : "");
-  return { updateId: update.update_id, chatId, kind: "message", text: text.slice(0, 8001), photo: extractPhoto(message) };
+  return {
+    updateId: update.update_id, chatId, kind: "message", text: text.slice(0, 8001), photo: extractPhoto(message),
+    // Used only to refresh this chat's language-specific Telegram menu.
+    languageCode: typeof sender.language_code === "string" ? sender.language_code.slice(0, 35) : "",
+  };
 }
 
 async function handleWebhook(request, env, ctx, fetchImpl) {
@@ -99,6 +103,11 @@ async function handleWebhook(request, env, ctx, fetchImpl) {
       ctx.waitUntil(sendReply(fetchImpl, token, event.chatId, "Сейчас очередь сообщений заполнена. Подожди немного и отправь сообщение ещё раз.").catch(() => {}));
     } else if (![200, 201].includes(res.status)) return reply("Временно недоступно", 503);
     if (event.callbackId) ctx.waitUntil(answerCallback(fetchImpl, token, event.callbackId).catch(() => {}));
+    // /start refreshes the left Telegram command menu without changing the
+    // webhook. Only allowlisted private chats can reach this point.
+    if (event.kind === "message" && /^\/start(?:@[a-z0-9_]{5,32})?(?:\s|$)/i.test(event.text.trim())) {
+      ctx.waitUntil(configureMenu(fetchImpl, token, event.chatId, event.languageCode).catch(() => {}));
+    }
     return reply("OK");
   } catch { return reply("Временно недоступно", 503); }
 }

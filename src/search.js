@@ -67,7 +67,8 @@ function normalizeResults(data, provider) {
   }).slice(0, 5);
 }
 
-async function claimBudget(env) {
+// Shared by ordinary web search and public-book discovery.
+export async function claimBudget(env) {
   try {
     if (!env.SEARCH_BUDGET) return false;
     const id = env.SEARCH_BUDGET.idFromName("shared-search-budget");

@@ -46,3 +46,42 @@ test("явный поиск при временной недоступности
   assert.equal(h.aiCalls.length, 0);
   assert.match(last(h), /не получилось найти информацию/i);
 });
+
+test("после успешного ручного поиска ссылки сохраняются в ответе при сбое всех моделей", async () => {
+  const h = makeHarness({ aiImpl: async () => { throw new Error("модель недоступна"); } });
+  await consent(h);
+  await h.send(h.message(ALICE, "/search версия Node", 3));
+  assert.equal(h.calls.filter((c) => c.url === "https://api.tavily.com/search").length, 1);
+  assert.match(last(h), /не получилось подготовить ответ/i);
+  assert.match(last(h), /проверь информацию самостоятельно/i);
+  assert.match(last(h), /Источники:/);
+  assert.match(last(h), /example\.org\/info/);
+});
+
+test("после успешного автоматического поиска ссылки сохраняются при сбое второй модели", async () => {
+  const h = makeHarness({ aiImpl: async (_model, input) => {
+    if (String(input.messages.at(-1).content).includes("Результаты поиска")) throw new Error("модель недоступна");
+    return { choices: [{ message: { content: null, tool_calls: [{ function: { name: "web_search", arguments: '{"query":"новости Node.js"}' } }] } }] };
+  } });
+  await consent(h);
+  await h.send(h.message(ALICE, "Найди новости Node", 3));
+  assert.match(last(h), /не получилось подготовить ответ/i);
+  assert.match(last(h), /example\.org\/info/);
+  assert.match(last(h), /Источники:/);
+});
+
+test("когда не работают и поиск, и модель, ссылки не выдумываются", async () => {
+  let first = true;
+  const h = makeHarness({
+    aiImpl: async () => {
+      if (first) { first = false; return { choices: [{ message: { content: "Нужно проверить." } }] }; }
+      throw new Error("модель недоступна");
+    },
+    networkImpl: async (url) => /tavily|exa\.ai/.test(url) ? new Response("недоступно", { status: 503 }) : null,
+  });
+  await consent(h);
+  await h.send(h.message(ALICE, "Какая текущая версия Node?", 3));
+  assert.match(last(h), /не получилось найти информацию/i);
+  assert.doesNotMatch(last(h), /Источники:/);
+  assert.doesNotMatch(last(h), /example\.org/);
+});

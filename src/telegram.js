@@ -1,15 +1,41 @@
 import { formatReply } from "./format.js";
+import { isSafeBook } from "./books.js";
 import { abortAfter, readBytes, readJson } from "./net.js";
 
+export const BOT_COMMANDS = [
+  { command: "new", description: "Создать новый чат" },
+  { command: "chats", description: "Открыть список чатов" },
+  { command: "chat", description: "Открыть чат по номеру" },
+  { command: "rename", description: "Переименовать текущий чат" },
+  { command: "search", description: "Найти информацию в интернете" },
+  { command: "book", description: "Найти книгу в PDF" },
+  { command: "mode", description: "Выбрать режим общения" },
+  { command: "memory", description: "Посмотреть память чата" },
+  { command: "remember", description: "Закрепить заметку" },
+  { command: "unpin", description: "Удалить закреплённую заметку" },
+  { command: "forget", description: "Удалить автоматическую заметку" },
+  { command: "clear", description: "Очистить историю и память чата" },
+  { command: "delete", description: "Удалить текущий чат" },
+  { command: "deleteall", description: "Удалить всё и отозвать согласие" },
+  { command: "privacy", description: "Как обрабатываются данные" },
+  { command: "help", description: "Помощь и команды" },
+  { command: "start", description: "Начать и обновить меню" },
+  { command: "agree", description: "Подтвердить согласие" },
+];
+
 const TELEGRAM_TIMEOUT_MS = 8_000;
+const TYPING_REFRESH_MS = 4_000;
+const TYPING_TIMEOUT_MS = 1_500;
+// Preserve the Workers Free subrequest budget during unusually long tasks.
+const MAX_TYPING_PULSES = 20;
 export const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 
-async function telegramPost(fetchImpl, token, method, body) {
+async function telegramPost(fetchImpl, token, method, body, signal = undefined) {
   try {
     const response = await fetchImpl(`https://api.telegram.org/bot${token}/${method}`, {
       method: "POST", redirect: "manual",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body), signal: abortAfter(TELEGRAM_TIMEOUT_MS),
+      body: JSON.stringify(body), signal: signal ?? abortAfter(TELEGRAM_TIMEOUT_MS),
     });
     const data = await readJson(response, 64 * 1024).catch(() => null);
     return { ok: response.ok && data?.ok === true, status: response.status, data };
@@ -19,6 +45,88 @@ async function telegramPost(fetchImpl, token, method, body) {
 export async function answerCallback(fetchImpl, token, queryId) {
   if (typeof queryId !== "string" || queryId.length > 256) return;
   await telegramPost(fetchImpl, token, "answerCallbackQuery", { callback_query_id: queryId });
+}
+
+// Configure only an authenticated private chat, never the webhook or token.
+// Telegram prefers a chat+language list to the chat fallback. Refresh Russian
+// and the language Telegram reported for this user as well as the fallback.
+// If the user's language changes later, another /start updates that scope.
+export async function configureMenu(fetchImpl, token, chatId, languageCode = "") {
+  const scope = { type: "chat", chat_id: chatId };
+  const language = typeof languageCode === "string" ? languageCode.match(/^([a-z]{2})(?:-[a-z0-9]{2,8})*$/i)?.[1]?.toLowerCase() : "";
+  const languages = new Set(["ru", ...(language ? [language] : [])]);
+  const requests = [
+    telegramPost(fetchImpl, token, "setMyCommands", { scope, commands: BOT_COMMANDS }),
+    ...[...languages].map((code) => telegramPost(fetchImpl, token, "setMyCommands", { scope, language_code: code, commands: BOT_COMMANDS })),
+    telegramPost(fetchImpl, token, "setChatMenuButton", { chat_id: chatId, menu_button: { type: "commands" } }),
+  ];
+  const results = await Promise.all(requests);
+  return results.every((r) => r.ok);
+}
+
+export async function sendBook(fetchImpl, token, chatId, book) {
+  if (!isSafeBook(book)) return { ok: false };
+  const header = [
+    `📚 ${String(book.title).slice(0, 180)}`,
+    book.author ? `Автор / атрибуция: ${String(book.author).slice(0, 120)}` : "",
+  ].filter(Boolean);
+  const extra = [book.year && String(book.year).slice(0, 10), book.language && `Язык по каталогу: ${String(book.language).slice(0, 60)}`,
+    book.volume && `Том: ${String(book.volume).slice(0, 40)}`, book.pages && `${book.pages} стр.`,
+    book.scanCount && `${book.scanCount} сканов в записи`, `${(book.size / 1_000_000).toFixed(1)} МБ`].filter(Boolean).join(" · ");
+  const legal = [
+    `Источник: ${book.sourceUrl}`,
+    `Условия: ${book.license.label}${book.license.url ? ` — ${book.license.url}` : ""}`,
+  ];
+  // If the source URL is unusually long, omit optional edition details rather
+  // than refusing an otherwise valid document or truncating attribution.
+  let details = [...header, extra, ...legal].filter(Boolean).join("\n");
+  if (details.length > 1024) details = [...header, ...legal].join("\n");
+  if (details.length > 1024) return { ok: false };
+  // Telegram fetches the catalogue's public PDF URL itself. Never retry an
+  // ambiguous sendDocument failure: the file may already have arrived.
+  return telegramPost(fetchImpl, token, "sendDocument", {
+    chat_id: chatId, document: book.url, caption: details, reply_markup: { remove_keyboard: true },
+  }, abortAfter(35_000));
+}
+
+// Telegram's status expires after about five seconds. It is a chat action, not
+// a message, and is refreshed only while the current answer is being prepared.
+export function startTyping(fetchImpl, token, chatId, requestedAction = "typing") {
+  const action = requestedAction === "upload_document" ? "upload_document" : "typing";
+  let active = true, interval, pending = null, controller = null, deadline = null, attempts = 0;
+  const pulse = () => {
+    if (!active || pending || attempts >= MAX_TYPING_PULSES) return; // Never overlap or queue status requests.
+    if (++attempts >= MAX_TYPING_PULSES) clearInterval(interval);
+    const request = new AbortController();
+    controller = request;
+    const timeout = setTimeout(() => request.abort(), TYPING_TIMEOUT_MS);
+    deadline = timeout;
+    const current = telegramPost(fetchImpl, token, "sendChatAction", { chat_id: chatId, action }, request.signal)
+      .finally(() => {
+        clearTimeout(timeout);
+        if (deadline === timeout) deadline = null;
+        if (controller === request) controller = null;
+        if (pending === current) pending = null;
+      });
+    pending = current;
+  };
+  interval = setInterval(pulse, TYPING_REFRESH_MS);
+  pulse();
+  return async () => {
+    if (!active) return;
+    active = false;
+    clearInterval(interval);
+    clearTimeout(deadline);
+    deadline = null;
+    controller?.abort();
+    // Do not let a stuck status request delay an answer indefinitely. Native
+    // fetch normally settles as soon as its signal is aborted.
+    if (pending) {
+      let guard;
+      await Promise.race([pending, new Promise((resolve) => { guard = setTimeout(resolve, 100); })]);
+      clearTimeout(guard);
+    }
+  };
 }
 
 export async function sendReply(fetchImpl, token, chatId, markdown, replyMarkup = undefined) {
