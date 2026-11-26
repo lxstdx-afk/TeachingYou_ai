@@ -4,15 +4,16 @@
   "main": "./worker.js",
   "compatibility_date": "2026-11-22",
   "keep_vars": true,
-  "ai": {
-    "binding": "AI"
-  },
+  "ai": { "binding": "AI" },
   "durable_objects": {
     "bindings": [
-      { "name": "UPDATE_GUARD", "class_name": "SeenUpdate" }
+      { "name": "UPDATE_GUARD", "class_name": "SeenUpdate" },
+      { "name": "USER_CHATS", "class_name": "UserConversations" },
+      { "name": "SEARCH_BUDGET", "class_name": "SearchBudget" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["SeenUpdate"] }
+    { "tag": "v1", "new_sqlite_classes": ["SeenUpdate"] },
+    { "tag": "v2", "new_sqlite_classes": ["UserConversations", "SearchBudget"] }
   ]
 }

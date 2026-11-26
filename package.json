@@ -8,9 +8,12 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node --test"
+    "test": "node --experimental-sqlite --test"
   },
   "devDependencies": {
     "wrangler": "4.166.0"
+  },
+  "dependencies": {
+    "marked": "18.3.0"
   }
 }

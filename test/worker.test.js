@@ -1,419 +1,287 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createWorker, SeenUpdate } from "../worker.js";
+import { UserConversations } from "../worker.js";
+import { ALICE, BOB, SECRET, TOKEN, makeHarness } from "./harness.js";
 
-// Все значения вымышлены. Настоящие Telegram и Workers AI не вызываются.
-const token = "test-bot-token-never-use";
-const secret = "test_webhook_secret_0123456789_abcdefgh";
-const alice = 123456;
-const bob = 234567;
-const model = "@cf/google/gemma-4-26b-a4b-it";
-const settings = {
-  TELEGRAM_BOT_TOKEN: token,
-  TELEGRAM_WEBHOOK_SECRET: secret,
-  TELEGRAM_ALLOWED_USER_IDS: `${alice}, ${bob}`,
-};
-
-function update(userId = alice, text = "Хочу идею проекта на React", id = 100, chatType = "private") {
-  const message = {
-    from: { id: userId, is_bot: false },
-    chat: { id: userId, type: chatType },
-  };
-  if (text !== null) message.text = text;
-  return { update_id: id, message };
+async function consent(h, user = ALICE, start = 1) {
+  await h.send(h.message(user, "/start", start));
+  await h.send(h.callback(user, "consent:yes", start + 1));
 }
+function texts(h) { return h.telegram().map((c) => c.body.text); }
+function chatCalls(h) { return h.aiCalls.filter((call) => String(call.input.messages[0]?.content).includes("TeachingYou AI")); }
 
-function webhook(body, suppliedSecret = secret, extraHeaders = {}) {
-  const headers = { "Content-Type": "application/json", ...extraHeaders };
-  if (suppliedSecret !== null) headers["X-Telegram-Bot-Api-Secret-Token"] = suppliedSecret;
-  return new Request("https://worker.example/telegram/webhook", {
-    method: "POST",
-    headers,
-    body: typeof body === "string" ? body : JSON.stringify(body),
-  });
-}
-
-function makeStorage() {
-  const values = new Map();
-  return {
-    values,
-    alarmAt: null,
-    kv: {
-      get(key) { return values.get(key); },
-      put(key, value) { values.set(key, value); },
-    },
-    async setAlarm(time) { this.alarmAt = time; },
-    async deleteAll() { values.clear(); this.alarmAt = null; },
-  };
-}
-
-// Здесь настоящая логика SeenUpdate, но хранилище полностью поддельное.
-function fakeGuard() {
-  const states = new Map();
-  const objects = new Map();
-  const claims = [];
-  return {
-    states,
-    claims,
-    idFromName(name) { return name; },
-    get(name) {
-      if (!objects.has(name)) {
-        const storage = makeStorage();
-        states.set(name, storage);
-        objects.set(name, new SeenUpdate({ storage }));
-      }
-      return {
-        async fetch(url, init) {
-          claims.push(name);
-          return objects.get(name).fetch(new Request(url, init));
-        },
-      };
-    },
-  };
-}
-
-function harness({ aiImpl, telegramImpl, guard = fakeGuard(), aiTimeoutMs = 22_000 } = {}) {
-  const telegramCalls = [];
-  const aiCalls = [];
-  const tasks = [];
-  const AI = {
-    async run(name, input) {
-      aiCalls.push({ name, input });
-      if (aiImpl) return aiImpl(name, input);
-      return { choices: [{ message: { content: "Давай разберёмся шаг за шагом." }, finish_reason: "stop" }] };
-    },
-  };
-  const fetchImpl = async (url, options) => {
-    telegramCalls.push({ url, options, body: JSON.parse(options.body) });
-    if (telegramImpl) return telegramImpl(url, options);
-    return Response.json({ ok: true });
-  };
-  const worker = createWorker({ fetchImpl, aiTimeoutMs });
-  const env = { ...settings, AI, UPDATE_GUARD: guard };
-  const ctx = { waitUntil(promise) { tasks.push(promise); } };
-  return {
-    worker, env, ctx, guard, tasks, aiCalls, telegramCalls,
-    async done() { await Promise.all(tasks); },
-    async send(item = update(), usedEnv = env, usedSecret = secret) {
-      const response = await worker.fetch(webhook(item, usedSecret), usedEnv, ctx);
-      await Promise.all(tasks);
-      return response;
-    },
-  };
-}
-
-function assertNoBrokenSurrogates(text) {
-  for (const character of text) {
-    const code = character.codePointAt(0);
-    assert.ok(!(code >= 0xd800 && code <= 0xdfff), "нельзя разделять эмодзи");
-  }
-}
-
-test("публичная страница не раскрывает состояние секретов", async () => {
-  const h = harness();
-  for (const env of [h.env, {}]) {
-    const response = await h.worker.fetch(new Request("https://worker.example/"), env, h.ctx);
-    assert.equal(response.status, 200);
-    const text = await response.text();
-    assert.equal(text, "TeachingYou AI: Worker работает.");
-    assert.ok(!text.includes(token));
-    assert.equal(response.headers.get("cache-control"), "no-store");
+test("публичная страница не раскрывает конфигурацию", async () => {
+  const h = makeHarness();
+  for (const env of [{}, h.env]) {
+    const res = await h.worker.fetch(new Request("https://worker.example/"), env, h.ctx);
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), "TeachingYou AI: Worker работает.");
+    assert.equal(res.headers.get("cache-control"), "no-store");
   }
 });
 
-test("неизвестные адреса и методы возвращают 404", async () => {
-  const h = harness();
-  for (const req of [
-    new Request("https://worker.example/telegram/webhook"),
-    new Request("https://worker.example/", { method: "POST" }),
-    new Request("https://worker.example/unknown"),
-  ]) assert.equal((await h.worker.fetch(req, h.env, h.ctx)).status, 404);
-});
-
-test("неполная или неверная конфигурация закрывает webhook", async () => {
-  const h = harness();
-  for (const partial of [
-    {},
-    { ...h.env, TELEGRAM_BOT_TOKEN: "" },
-    { ...h.env, TELEGRAM_WEBHOOK_SECRET: "too-short" },
-    { ...h.env, TELEGRAM_ALLOWED_USER_IDS: "" },
-    { ...h.env, TELEGRAM_ALLOWED_USER_IDS: `${alice},invalid` },
-    { ...h.env, TELEGRAM_ALLOWED_USER_IDS: "9007199254740992" },
-  ]) assert.equal((await h.worker.fetch(webhook(update()), partial, h.ctx)).status, 503);
-  assert.equal(h.guard.claims.length, 0);
+test("неверные настройки и секрет закрывают webhook до обращения к хранилищу", async () => {
+  const h = makeHarness();
+  for (const env of [{}, { ...h.env, TELEGRAM_BOT_TOKEN: "" }, { ...h.env, TELEGRAM_WEBHOOK_SECRET: "short" }, { ...h.env, TELEGRAM_ALLOWED_USER_IDS: "1,broken" }, { ...h.env, TELEGRAM_ALLOWED_USER_IDS: "9007199254740992" }]) {
+    assert.equal((await h.worker.fetch(h.request(h.message()), env, h.ctx)).status, 503);
+  }
+  for (const secret of [null, "wrong", "z".repeat(257)]) assert.equal((await h.worker.fetch(h.request(h.message(), secret), h.env, h.ctx)).status, 403);
+  assert.equal(h.users.size, 0);
   assert.equal(h.aiCalls.length, 0);
-  assert.equal(h.telegramCalls.length, 0);
 });
 
-test("неверный или отсутствующий секрет отклоняется до любого обращения к ИИ", async () => {
-  const h = harness();
-  for (const supplied of [null, "wrong", "x".repeat(secret.length), "z".repeat(257)]) {
-    assert.equal((await h.worker.fetch(webhook(update(), supplied), h.env, h.ctx)).status, 403);
-  }
-  assert.equal(h.guard.claims.length, 0);
-  assert.equal(h.aiCalls.length, 0);
-  assert.equal(h.telegramCalls.length, 0);
-});
-
-test("запрещённые пользователи, группы, боты и чужой chat_id игнорируются", async () => {
-  const h = harness();
+test("посторонние, группы, другие chat_id и сообщения ботов игнорируются", async () => {
+  const h = makeHarness();
   const variants = [
-    update(345678),
-    update(alice, "Привет", 101, "group"),
-    { update_id: 102, message: { from: { id: alice, is_bot: true }, chat: { id: alice, type: "private" }, text: "Привет" } },
-    { update_id: 103, message: { from: { id: alice, is_bot: false }, chat: { id: bob, type: "private" }, text: "Привет" } },
-    { update_id: 104, edited_message: { text: "Изменение" } },
+    h.message(345678, "чужой", 1),
+    { update_id: 2, message: { from: { id: ALICE }, chat: { id: ALICE, type: "group" }, text: "группа" } },
+    { update_id: 3, message: { from: { id: ALICE, is_bot: true }, chat: { id: ALICE, type: "private" }, text: "бот" } },
+    { update_id: 4, message: { from: { id: ALICE }, chat: { id: BOB, type: "private" }, text: "чужой чат" } },
+    { update_id: 5, edited_message: { text: "изменение" } },
   ];
   for (const item of variants) assert.equal((await h.send(item)).status, 200);
-  assert.equal(h.guard.claims.length, 0);
+  assert.equal(h.users.size, 0);
+  assert.equal(h.telegram().length, 0);
+});
+
+test("JSON, размер и идентификатор update проверяются", async () => {
+  const h = makeHarness();
+  assert.equal((await h.worker.fetch(h.request("{bad"), h.env, h.ctx)).status, 400);
+  assert.equal((await h.worker.fetch(h.request("x".repeat(131073)), h.env, h.ctx)).status, 413);
+  for (const id of [0, -1, "42", 1.5, Number.MAX_SAFE_INTEGER + 1]) assert.equal((await h.send(h.message(ALICE, "x", id))).status, 400);
+});
+
+test("до согласия вопрос и file_id не сохраняются и не отправляются ИИ", async () => {
+  const h = makeHarness();
+  const item = h.message(ALICE, "секретный текст без согласия", 1, { photo: [{ file_id: "private-file", width: 10, height: 10 }] });
+  await h.send(item, { run: false });
+  const payload = h.user().rows("SELECT payload FROM jobs")[0].payload;
+  assert.ok(!payload.includes("секретный"));
+  assert.ok(!payload.includes("private-file"));
+  await h.drain();
   assert.equal(h.aiCalls.length, 0);
-  assert.equal(h.telegramCalls.length, 0);
+  assert.match(texts(h)[0], /Перед началом/);
+  assert.match(texts(h)[0], /OpenRouter/);
+  assert.ok(h.telegram()[0].body.reply_markup.inline_keyboard[0][0].callback_data === "consent:yes");
 });
 
-test("разрешённому пользователю отвечает ИИ, а не эхо", async () => {
-  const h = harness();
-  const response = await h.send();
-  assert.equal(response.status, 200);
-  assert.equal(await response.text(), "OK");
-  assert.equal(h.aiCalls.length, 1);
-  assert.equal(h.aiCalls[0].name, model);
-  assert.deepEqual(h.aiCalls[0].input.messages.map((m) => m.role), ["system", "user"]);
-  assert.equal(h.aiCalls[0].input.messages[1].content, "Хочу идею проекта на React");
-  assert.equal(h.aiCalls[0].input.max_completion_tokens, 1024);
-  assert.equal(h.aiCalls[0].input.chat_template_kwargs.enable_thinking, false);
-  assert.equal(h.aiCalls[0].input.store, false);
-  assert.equal(h.telegramCalls.length, 1);
-  assert.equal(h.telegramCalls[0].url, `https://api.telegram.org/bot${token}/sendMessage`);
-  assert.equal(h.telegramCalls[0].options.method, "POST");
-  assert.equal(h.telegramCalls[0].options.redirect, "manual");
-  assert.ok(h.telegramCalls[0].options.signal instanceof AbortSignal);
-  assert.deepEqual(h.telegramCalls[0].body, { chat_id: alice, text: "Давай разберёмся шаг за шагом." });
+test("после согласия ответы форматируются и история передаётся в модель", async () => {
+  const h = makeHarness(); await consent(h);
+  await h.send(h.message(ALICE, "Меня интересует React", 3));
+  await h.send(h.message(ALICE, "А с чего начать?", 4));
+  const calls = chatCalls(h);
+  assert.equal(calls.length, 2);
+  const second = JSON.stringify(calls[1].input.messages);
+  assert.ok(second.includes("Меня интересует React"));
+  assert.ok(second.includes("А с чего начать?"));
+  const response = h.telegram().at(-1).body;
+  assert.ok(!response.text.includes("**"));
+  assert.ok(!response.text.includes("# Ответ"));
+  assert.ok(response.entities.some((e) => e.type === "bold"));
+  assert.ok(response.entities.some((e) => e.type === "code"));
+  assert.ok(calls[1].input.messages[0].content.includes("Не здоровайся заново"));
 });
 
-test("webhook подтверждается до получения ответа нейросети", async () => {
-  let resolveAi;
-  const h = harness({ aiImpl: () => new Promise((resolve) => { resolveAi = resolve; }) });
-  const response = await h.worker.fetch(webhook(update()), h.env, h.ctx);
-  assert.equal(response.status, 200);
-  assert.equal(h.telegramCalls.length, 0);
-  assert.equal(h.tasks.length, 1);
-  resolveAi({ choices: [{ message: { content: "Ответ готов" } }] });
-  await h.done();
-  assert.equal(h.telegramCalls[0].body.text, "Ответ готов");
+test("пользователи и чаты не смешивают историю и закреплённую память", async () => {
+  const h = makeHarness(); await consent(h, ALICE, 1); await consent(h, BOB, 3);
+  await h.send(h.message(ALICE, "Секретное название моего проекта АЛЬФА", 5));
+  await h.send(h.message(ALICE, "/remember Мой проект АЛЬФА на Windows", 6));
+  await h.send(h.message(ALICE, "/new Проект Бета", 7));
+  await h.send(h.message(ALICE, "В новом чате работаю над БЕТА", 8));
+  const betaContext = JSON.stringify(chatCalls(h).at(-1).input.messages);
+  assert.ok(betaContext.includes("БЕТА"));
+  assert.ok(!betaContext.includes("АЛЬФА"));
+  await h.send(h.message(BOB, "У меня третий проект ДЕЛЬТА", 9));
+  const bobContext = JSON.stringify(chatCalls(h).at(-1).input.messages);
+  assert.ok(!bobContext.includes("АЛЬФА"));
+  assert.ok(!bobContext.includes("БЕТА"));
+  await h.send(h.callback(ALICE, "switch:1", 10));
+  await h.send(h.message(ALICE, "Что дальше?", 11));
+  const alphaContext = JSON.stringify(chatCalls(h).at(-1).input.messages);
+  assert.ok(alphaContext.includes("АЛЬФА"));
+  assert.ok(!alphaContext.includes("БЕТА"));
+  assert.equal(h.user(ALICE).rows("SELECT COUNT(*) AS n FROM chats")[0].n, 2);
+  assert.equal(h.user(BOB).rows("SELECT COUNT(*) AS n FROM chats")[0].n, 1);
 });
 
-test("два разрешённых пользователя получают ответы без общей истории", async () => {
-  const h = harness();
-  await h.send(update(alice, "Первый вопрос", 100));
-  await h.send(update(bob, "Второй вопрос", 101));
-  assert.deepEqual(h.telegramCalls.map((c) => c.body.chat_id), [alice, bob]);
-  assert.deepEqual(h.aiCalls.map((c) => c.input.messages[1].content), ["Первый вопрос", "Второй вопрос"]);
-  assert.ok(h.aiCalls.every((c) => c.input.messages.length === 2));
-  assert.ok(!JSON.stringify(h.aiCalls[1].input).includes("Первый вопрос"));
+test("очередь по одному пользователю сохраняет порядок команд и не дублирует update", async () => {
+  const h = makeHarness(); await consent(h);
+  await h.send(h.message(ALICE, "/new Новый", 4), { run: false });
+  await h.send(h.message(ALICE, "/new Новый", 4), { run: false });
+  await h.send(h.message(ALICE, "вопрос в новом чате", 5), { run: false });
+  await h.drain();
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM chats")[0].n, 2);
+  const chat = h.user().rows("SELECT id FROM chats WHERE title=?", "Новый")[0];
+  assert.equal(h.user().rows("SELECT chat_id FROM messages WHERE role='user'")[0].chat_id, chat.id);
+  assert.equal(texts(h).filter((x) => x.includes("Создан новый чат")).length, 1);
 });
 
-test("/start и /help объясняют обработку и ограничения, не вызывая модель", async () => {
-  const h = harness();
-  await h.send(update(alice, "/start", 100));
-  await h.send(update(alice, "/help", 101));
-  assert.equal(h.aiCalls.length, 0);
-  assert.match(h.telegramCalls[0].body.text, /Cloudflare Workers AI/);
-  assert.match(h.telegramCalls[0].body.text, /не запоминаю/);
-  assert.match(h.telegramCalls[0].body.text, /не присылай пароли/);
-  assert.match(h.telegramCalls[1].body.text, /память, поиск и изображения/);
+test("/mode меняет режим только выбранного чата", async () => {
+  const h = makeHarness(); await consent(h);
+  await h.send(h.callback(ALICE, "mode:1:ideas", 3));
+  await h.send(h.message(ALICE, "Предложи идею", 4));
+  assert.ok(chatCalls(h).at(-1).input.messages[0].content.includes("Режим: идеи"));
+  await h.send(h.message(ALICE, "/new Другая тема", 5));
+  assert.equal(h.user().rows("SELECT mode FROM chats WHERE id=2")[0].mode, "mentor");
 });
 
-test("неизвестная команда, картинка и пустой текст не уходят в ИИ", async () => {
-  const h = harness();
-  const picture = update(alice, null, 101);
-  picture.message.photo = [{ file_id: "fake" }];
-  picture.message.caption = "описание";
-  await h.send(update(alice, "/unknown", 100));
-  await h.send(picture);
-  await h.send(update(alice, "  ", 102));
-  assert.equal(h.aiCalls.length, 0);
-  assert.match(h.telegramCalls[0].body.text, /Не знаю такую команду/);
-  assert.match(h.telegramCalls[1].body.text, /только с текстом/);
-  assert.match(h.telegramCalls[2].body.text, /только с текстом/);
-});
-
-test("код или путь, начинающийся с косой черты, не считается командой", async () => {
-  const h = harness();
-  await h.send(update(alice, "/usr/bin/node — что это?", 103));
-  assert.equal(h.aiCalls.length, 1);
-  assert.equal(h.aiCalls[0].input.messages[1].content, "/usr/bin/node — что это?");
-});
-
-test("слишком длинный пользовательский текст отклоняется до вызова ИИ", async () => {
-  const h = harness();
-  await h.send(update(alice, "а".repeat(8001)));
-  assert.equal(h.aiCalls.length, 0);
-  assert.match(h.telegramCalls[0].body.text, /слишком длинное/);
-});
-
-test("формат response также поддерживается", async () => {
-  const h = harness({ aiImpl: async () => ({ response: "Другой формат" }) });
-  await h.send();
-  assert.equal(h.telegramCalls[0].body.text, "Другой формат");
-});
-
-test("если модель сообщает об обрыве, пользователь получает предупреждение", async () => {
-  const h = harness({ aiImpl: async () => ({ choices: [{ message: { content: "Неполный ответ" }, finish_reason: "length" }] }) });
-  await h.send();
-  assert.match(h.telegramCalls[0].body.text, /оборвался из-за ограничения длины/);
-});
-
-test("ошибка или лимит ИИ не раскрывают подробности, ключи и содержимое ошибки", async () => {
-  for (const aiImpl of [
-    async () => { throw new Error(`429 private ${token} ${secret}`); },
-    async () => ({ choices: [{ message: { content: "" } }] }),
-    async () => null,
-  ]) {
-    const h = harness({ aiImpl });
-    const response = await h.send();
-    assert.equal(response.status, 200);
-    const text = h.telegramCalls[0].body.text;
-    assert.match(text, /не удалось получить ответ/);
-    assert.ok(!text.includes(token));
-    assert.ok(!text.includes(secret));
-    assert.ok(!text.includes("private"));
-  }
-});
-
-test("отсутствие AI binding не превращается в раскрытие ошибки", async () => {
-  const h = harness();
-  const response = await h.send(update(), { ...h.env, AI: undefined });
-  assert.equal(response.status, 200);
-  assert.match(h.telegramCalls[0].body.text, /не удалось получить ответ/);
-});
-
-test("долгая модель получает тайм-аут и понятное сообщение", async () => {
-  const h = harness({ aiTimeoutMs: 5, aiImpl: () => new Promise(() => {}) });
-  const response = await h.send();
-  assert.equal(response.status, 200);
-  assert.match(h.telegramCalls[0].body.text, /не удалось получить ответ/);
-  assert.equal(h.aiCalls.length, 1);
-});
-
-test("длинный ответ разбивается на части, не разрывая эмодзи", async () => {
-  const output = "🙂".repeat(1800);
-  const h = harness({ aiImpl: async () => ({ choices: [{ message: { content: output } }] }) });
-  await h.send();
-  const parts = h.telegramCalls.map((c) => c.body.text);
-  assert.equal(parts.length, 2);
-  assert.equal(parts.join(""), output);
-  for (const part of parts) {
-    assert.ok(part.length <= 3500);
-    assertNoBrokenSurrogates(part);
-  }
-});
-
-test("чрезмерно длинный ответ ограничен двумя сообщениями с пояснением", async () => {
-  const h = harness({ aiImpl: async () => ({ response: "🙂".repeat(7000) }) });
-  await h.send();
-  assert.equal(h.telegramCalls.length, 2);
-  assert.match(h.telegramCalls[1].body.text, /Ответ сокращён/);
-  for (const call of h.telegramCalls) {
-    assert.ok(call.body.text.length <= 3500);
-    assertNoBrokenSurrogates(call.body.text);
-  }
-});
-
-test("неправильный JSON и пустое тело отклоняются", async () => {
-  const h = harness();
-  assert.equal((await h.worker.fetch(webhook("{ broken"), h.env, h.ctx)).status, 400);
-  assert.equal((await h.worker.fetch(webhook(""), h.env, h.ctx)).status, 400);
-  assert.equal(h.guard.claims.length, 0);
-  assert.equal(h.aiCalls.length, 0);
-});
-
-test("слишком большой запрос отклоняется по заголовку и реальному размеру", async () => {
-  const h = harness();
-  const announced = await h.worker.fetch(webhook("{}", secret, { "Content-Length": "131073" }), h.env, h.ctx);
-  const actual = await h.worker.fetch(webhook("x".repeat(131073)), h.env, h.ctx);
-  assert.equal(announced.status, 413);
-  assert.equal(actual.status, 413);
-  assert.equal(h.guard.claims.length, 0);
-});
-
-test("для разрешённого пользователя необходим корректный update_id", async () => {
-  const h = harness();
-  for (const id of [undefined, null, 0, -1, "100", 1.5, Number.MAX_SAFE_INTEGER + 1]) {
-    const item = update();
-    item.update_id = id;
-    assert.equal((await h.send(item)).status, 400);
-  }
-  assert.equal(h.guard.claims.length, 0);
-  assert.equal(h.aiCalls.length, 0);
-});
-
-test("ошибка хранилища до подтверждения webhook возвращает 503 без ИИ", async () => {
-  for (const guard of [undefined, null, { idFromName() { throw new Error("private"); } }]) {
-    const h = harness();
-    const response = await h.send(update(), { ...h.env, UPDATE_GUARD: guard });
-    assert.equal(response.status, 503);
-    assert.ok(!(await response.text()).includes("private"));
-    assert.equal(h.aiCalls.length, 0);
-    assert.equal(h.telegramCalls.length, 0);
-  }
-});
-
-test("повторная и параллельная доставка одного update_id вызывает ИИ один раз", async () => {
-  const h = harness();
-  const responses = await Promise.all(Array.from({ length: 8 }, () => h.worker.fetch(webhook(update()), h.env, h.ctx)));
-  assert.ok(responses.every((r) => r.status === 200));
-  await h.done();
-  assert.equal(h.guard.claims.length, 8);
-  assert.equal(h.aiCalls.length, 1);
-  assert.equal(h.telegramCalls.length, 1);
-});
-
-test("разные update_id обрабатываются отдельно, даже с одинаковым текстом", async () => {
-  const h = harness();
-  await h.send(update(alice, "Привет", 100));
-  await h.send(update(alice, "Привет", 101));
-  assert.equal(h.aiCalls.length, 2);
-  assert.equal(h.telegramCalls.length, 2);
-});
-
-test("SeenUpdate сохраняет только метку, планирует очистку и очищает данные", async () => {
-  const storage = makeStorage();
-  const obj = new SeenUpdate({ storage });
-  const req = () => new Request("https://updates.internal/claim", { method: "POST" });
-  assert.equal((await obj.fetch(req())).status, 201);
-  assert.deepEqual([...storage.values], [["seen", true]]);
-  const hours = (storage.alarmAt - Date.now()) / 3_600_000;
-  assert.ok(hours > 47.9 && hours <= 48);
-  assert.equal((await new SeenUpdate({ storage }).fetch(req())).status, 200);
-  await obj.alarm();
-  assert.equal(storage.values.size, 0);
-  assert.equal((await obj.fetch(req())).status, 201);
-});
-
-test("ошибка Telegram после подтверждения не раскрывает токен и не запускает повтор автоматически", async () => {
-  const h = harness({ telegramImpl: async (url) => { throw new Error(`private ${url}`); } });
-  const first = await h.send();
-  const duplicate = await h.send();
-  assert.equal(first.status, 200);
-  assert.equal(duplicate.status, 200);
-  assert.ok(!(await first.text()).includes(token));
-  assert.equal(h.aiCalls.length, 1);
-  assert.equal(h.telegramCalls.length, 1);
-});
-
-test("Telegram ok:false останавливает дальнейшие части ответа", async () => {
-  const h = harness({
-    aiImpl: async () => ({ response: "x".repeat(8000) }),
-    telegramImpl: async () => Response.json({ ok: false, description: `private ${token}` }),
+test("старые сообщения находятся по ключевым словам, после повторного создания объекта память сохраняется", async () => {
+  const h = makeHarness(); await consent(h);
+  const obj = h.user();
+  obj.transaction(() => {
+    obj.addMessage(1, "user", "Наше уникальное название проекта ЛЮМИНОС и важная настройка", 1000);
+    obj.addMessage(1, "assistant", "Помню проект ЛЮМИНОС", 1000);
+    for (let i = 0; i < 12; i++) {
+      obj.addMessage(1, "user", `Другой вопрос ${i}`, 1100 + i);
+      obj.addMessage(1, "assistant", `Другой ответ ${i}`, 1100 + i);
+    }
   });
-  await h.send();
-  assert.equal(h.telegramCalls.length, 1);
+  const storage = h.stores.get(String(ALICE));
+  const reboot = new UserConversations({ storage }, h.env);
+  const context = JSON.stringify(reboot.context(reboot.chat(1), "Напомни настройку ЛЮМИНОС", null));
+  assert.ok(context.includes("Наше уникальное название проекта ЛЮМИНОС"));
 });
 
-test("без waitUntil webhook не подтверждается и ИИ не вызывается", async () => {
-  const h = harness();
-  const response = await h.worker.fetch(webhook(update()), h.env, undefined);
-  assert.equal(response.status, 503);
-  assert.equal(h.guard.claims.length, 0);
+test("через несколько сообщений создаётся структурированная память, а архив остаётся", async () => {
+  const h = makeHarness(); await consent(h);
+  for (let i = 0; i < 3; i++) await h.send(h.message(ALICE, `Учим JavaScript шаг ${i}`, i + 3));
+  const notes = h.user().rows("SELECT category,text FROM memory_notes WHERE chat_id=1");
+  assert.deepEqual(notes.map((n) => [n.category, n.text]), [["goals", "Изучить JavaScript"]]);
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages WHERE chat_id=1")[0].n, 6);
+  await h.send(h.message(ALICE, "/memory", 6));
+  assert.match(texts(h).at(-1), /Цели/);
+  assert.match(texts(h).at(-1), /Изучить JavaScript/);
+});
+
+test("неверный JSON авто-памяти не уничтожает старые данные и историю", async () => {
+  const h = makeHarness({ aiImpl: async (_model, input) => {
+    if (input.messages[0].content.includes("Извлекай факты")) return { choices: [{ message: { content: "{invalid" } }] };
+    return { choices: [{ message: { content: "готово" } }] };
+  } });
+  await consent(h);
+  await h.send(h.message(ALICE, "/remember важный факт", 3));
+  for (let i = 0; i < 3; i++) await h.send(h.message(ALICE, `сообщение ${i}`, i + 4));
+  assert.equal(h.user().chat(1).summary_through, 0);
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages")[0].n, 6);
+  assert.equal(h.user().rows("SELECT text FROM pins")[0].text, "важный факт");
+});
+
+test("очистка и удаление работают только для выбранного чата", async () => {
+  const h = makeHarness(); await consent(h);
+  await h.send(h.message(ALICE, "Первый проект", 3));
+  await h.send(h.message(ALICE, "/remember Факт первого", 4));
+  await h.send(h.message(ALICE, "/new Второй", 5));
+  await h.send(h.message(ALICE, "Второй проект", 6));
+  await h.send(h.message(ALICE, "/clear", 7));
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages WHERE chat_id=2")[0].n, 2);
+  const clear = h.telegram().at(-1).body.reply_markup.inline_keyboard[0][0].callback_data;
+  await h.send(h.callback(ALICE, clear, 8));
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages WHERE chat_id=2")[0].n, 0);
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages WHERE chat_id=1")[0].n, 2);
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM pins WHERE chat_id=1")[0].n, 1);
+  await h.send(h.message(ALICE, "/chat 1", 9));
+  await h.send(h.message(ALICE, "/delete", 10));
+  const remove = h.telegram().at(-1).body.reply_markup.inline_keyboard[0][0].callback_data;
+  await h.send(h.callback(ALICE, remove, 11));
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages WHERE chat_id=1")[0].n, 0);
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM pins WHERE chat_id=1")[0].n, 0);
+  assert.equal(h.user().chat(1), undefined);
+});
+
+test("deleteall стирает только данные пользователя и повторно спрашивает согласие", async () => {
+  const h = makeHarness(); await consent(h, ALICE, 1); await consent(h, BOB, 3);
+  await h.send(h.message(ALICE, "Личная история A", 5));
+  await h.send(h.message(BOB, "Личная история B", 6));
+  await h.send(h.message(ALICE, "/deleteall", 7));
+  const confirm = h.telegram().at(-1).body.reply_markup.inline_keyboard[0][0].callback_data;
+  await h.send(h.callback(ALICE, confirm, 8));
+  assert.equal(h.user(ALICE).rows("SELECT COUNT(*) AS n FROM messages")[0].n, 0);
+  assert.equal(h.user(ALICE).rows("SELECT COUNT(*) AS n FROM message_search")[0].n, 0);
+  assert.equal(h.user(ALICE).meta("consent"), undefined);
+  assert.equal(h.user(BOB).rows("SELECT COUNT(*) AS n FROM messages")[0].n, 2);
+  const aiBefore = h.aiCalls.length;
+  await h.send(h.message(ALICE, "ещё один вопрос", 9));
+  assert.equal(h.aiCalls.length, aiBefore);
+  assert.match(texts(h).at(-1), /Перед началом/);
+});
+
+test("явный запрос ищет, возвращает действительные источники и не передаёт историю в поисковый API", async () => {
+  const h = makeHarness(); await consent(h);
+  await h.send(h.message(ALICE, "Личный контекст проекта", 3));
+  await h.send(h.message(ALICE, "/search актуальная версия Node.js", 4));
+  const request = h.calls.find((c) => c.url === "https://api.tavily.com/search");
+  assert.equal(request.body.query, "актуальная версия Node.js");
+  assert.ok(!JSON.stringify(request.body).includes("Личный контекст"));
+  assert.match(texts(h).at(-1), /example.org\/info/);
+  assert.match(JSON.stringify(chatCalls(h).at(-1).input.messages), /недоверенные данные/);
+});
+
+test("модель сама запрашивает поиск и получает результат перед ответом", async () => {
+  const h = makeHarness({ aiImpl: async (_model, input) => {
+    if (input.messages[0].content.includes("Извлекай факты")) return { choices: [{ message: { content: '{}' } }] };
+    const last = input.messages.at(-1).content;
+    if (typeof last === "string" && last.includes("Результаты поиска")) return { choices: [{ message: { content: "По источнику [1] есть новости." } }] };
+    return { choices: [{ message: { content: null, tool_calls: [{ function: { name: "web_search", arguments: '{"query":"текущая версия Node.js"}' } }] } }] };
+  } });
+  await consent(h);
+  await h.send(h.message(ALICE, "Какая версия Node сейчас актуальна?", 3));
+  assert.ok(h.calls.some((c) => c.url === "https://api.tavily.com/search" && c.body.query === "текущая версия Node.js"));
+  assert.match(texts(h).at(-1), /По источнику/);
+  assert.match(texts(h).at(-1), /example.org/);
+});
+
+test("когда поиск выключен, явный запрос не посылается внешнему сервису", async () => {
+  const h = makeHarness({ settings: { SEARCH_ENABLED: "false" } }); await consent(h);
+  await h.send(h.message(ALICE, "/search версия Node", 3));
+  assert.match(texts(h).at(-1), /Поиск выключен/);
+  assert.ok(!h.calls.some((c) => c.url === "https://api.tavily.com/search"));
+});
+
+test("фото отправляется в ИИ как bytes, а не как Telegram URL с токеном", async () => {
+  const h = makeHarness(); await consent(h);
+  await h.send(h.message(ALICE, null, 3, { caption: "Что на скриншоте?", photo: [{ file_id: "fake-file-id", width: 100, height: 100, file_size: 6 }] }));
+  const input = chatCalls(h).at(-1).input;
+  const image = input.messages.at(-1).content.find((part) => part.type === "image_url").image_url.url;
+  assert.ok(image.startsWith("data:image/jpeg;base64,"));
+  assert.ok(!JSON.stringify(input).includes(TOKEN));
+  assert.ok(!JSON.stringify(input).includes("fake-file-id"));
+  const stored = JSON.stringify(h.user().rows("SELECT text FROM messages"));
+  assert.ok(!stored.includes("base64"));
+  assert.ok(!stored.includes("fake-file-id"));
+  assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM jobs")[0].n, 0);
+});
+
+test("подозрительный file_path отклоняется без скачивания и вызова ИИ", async () => {
+  const h = makeHarness({ networkImpl: async (url) => url.endsWith("/getFile") ? Response.json({ ok: true, result: { file_path: "../../outside" } }) : null });
+  await consent(h);
+  await h.send(h.message(ALICE, null, 3, { photo: [{ file_id: "fake", width: 20, height: 20 }] }));
   assert.equal(h.aiCalls.length, 0);
+  assert.ok(!h.calls.some((c) => c.url.includes("/file/bot")));
+  assert.match(texts(h).at(-1), /Не удалось открыть/);
+});
+
+test("неизвестный путь /usr/bin отправляется как вопрос, а слишком длинный текст отклоняется", async () => {
+  const h = makeHarness(); await consent(h);
+  await h.send(h.message(ALICE, "/usr/bin/node — что это?", 3));
+  assert.ok(JSON.stringify(chatCalls(h).at(-1).input.messages).includes("/usr/bin/node"));
+  const before = h.aiCalls.length;
+  await h.send(h.message(ALICE, "x".repeat(8001), 4));
+  assert.equal(h.aiCalls.length, before);
+  assert.match(texts(h).at(-1), /слишком длинное/);
+});
+
+test("после неопределённого сбоя отправка готового сообщения не повторяется", async () => {
+  const h = makeHarness(); await consent(h);
+  const obj = h.user();
+  await h.send(h.message(ALICE, "тест", 3), { run: false });
+  obj.sql.exec("UPDATE jobs SET state='sending',result=? WHERE update_id=3", JSON.stringify({ text: "не повторять" }));
+  const before = h.telegram().length;
+  await h.drain();
+  assert.equal(h.telegram().length, before);
+  assert.equal(obj.rows("SELECT COUNT(*) AS n FROM jobs")[0].n, 0);
+});
+
+test("отсутствующее хранилище приводит к 503, чтобы Telegram мог повторить", async () => {
+  const h = makeHarness();
+  assert.equal((await h.send(h.message(), { usedEnv: { ...h.env, USER_CHATS: undefined } })).status, 503);
 });
