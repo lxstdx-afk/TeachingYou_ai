@@ -14,7 +14,7 @@ test("завершившаяся после очистки сводка не в�
     return { choices: [{ message: { content: "ответ" } }] };
   } });
   await h.send(h.message(ALICE, "/start", 1));
-  await h.send(h.callback(ALICE, "consent:yes", 2));
+  await h.send(h.message(ALICE, "✅ Согласен(на), начать", 2));
   const obj = h.user();
   obj.transaction(() => {
     for (let i = 0; i < 3; i++) {

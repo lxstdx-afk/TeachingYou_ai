@@ -74,3 +74,57 @@ test("неопределённая ошибка сети не вызывает �
   assert.equal(await sendReply(f, "fake", 1, "**Текст**"), false);
   assert.equal(attempts, 1);
 });
+
+test("конечные отступы и пробелы в коде не удаляются", () => {
+  const markdown = '```python\ndef greet():\n    return "🙂"  \n  \n```';
+  const result = markdownToTelegram(markdown);
+  assert.equal(result.text, 'def greet():\n    return "🙂"  \n  ');
+  assert.deepEqual(result.entities, [{ type: "pre", offset: 0, length: result.text.length, language: "python" }]);
+});
+
+test("жирное вокруг вставки кода сохраняется с обеих сторон без пересечения", () => {
+  const result = markdownToTelegram("**До `const x` и после**");
+  const content = (e) => result.text.slice(e.offset, e.offset + e.length);
+  assert.deepEqual(result.entities.filter((e) => e.type === "bold").map(content), ["До ", " и после"]);
+  assert.equal(content(result.entities.find((e) => e.type === "code")), "const x");
+});
+
+test("длинный блок сохраняет отступы, язык, эмодзи и все символы после деления", async () => {
+  const code = 'const x = 1;\n' + '  x += 2;\n'.repeat(420) + 'console.log("🙂");';
+  const markdown = 'Пример 🙂\n\n```javascript\n' + code + '\n```\n\nЗначение `x`.';
+  const expected = markdownToTelegram(markdown);
+  const sent = [];
+  const fetchImpl = async (_url, options) => { sent.push(JSON.parse(options.body)); return Response.json({ ok: true }); };
+  assert.equal(await sendReply(fetchImpl, "fake", 1, markdown), true);
+  assert.ok(sent.length > 1);
+  assert.equal(sent.map((part) => part.text).join(""), expected.text);
+  assert.equal(sent.flatMap((part) => (part.entities || []).filter((e) => e.type === "pre")
+    .map((e) => part.text.slice(e.offset, e.offset + e.length))).join(""), code);
+  for (const part of sent) {
+    assert.ok(part.text.length <= 3500);
+    for (const e of part.entities || []) {
+      assert.ok(e.offset >= 0 && e.offset + e.length <= part.text.length);
+      if (e.type === "pre") assert.equal(e.language, "javascript");
+    }
+    for (const c of part.text) assert.ok(!(c.codePointAt(0) >= 0xd800 && c.codePointAt(0) <= 0xdfff));
+  }
+});
+
+test("небольшой кодовый блок не разрывается из-за предшествующего текста", () => {
+  const code = '    print("ok")\n'.repeat(50).trimEnd();
+  const markdown = 'a'.repeat(3200) + '\n\n```python\n' + code + '\n```\n\nГотово.';
+  const expected = markdownToTelegram(markdown);
+  const parts = formatReply(markdown);
+  assert.equal(parts.map((p) => p.text).join(""), expected.text);
+  const blocks = parts.flatMap((p) => p.entities.filter((e) => e.type === "pre").map((e) => ({ part: p, entity: e })));
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].part.text.slice(blocks[0].entity.offset, blocks[0].entity.offset + blocks[0].entity.length), code);
+});
+
+test("предупреждение о сокращении не попадает внутрь форматирования кода", () => {
+  const parts = formatReply('```js\n' + 'x'.repeat(15000) + '\n```');
+  assert.equal(parts.length, 4);
+  const last = parts.at(-1), notice = last.text.indexOf("… Ответ сокращён");
+  assert.ok(notice >= 0);
+  assert.ok(last.entities.filter((e) => e.type === "pre").every((e) => e.offset + e.length <= notice));
+});

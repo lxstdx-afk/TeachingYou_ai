@@ -4,7 +4,7 @@ import { ALICE, makeHarness } from "./harness.js";
 
 async function consent(h) {
   await h.send(h.message(ALICE, "/start", 1));
-  await h.send(h.callback(ALICE, "consent:yes", 2));
+  await h.send(h.message(ALICE, "✅ Согласен(на), начать", 2));
 }
 function last(h) { return h.telegram().at(-1).body.text; }
 

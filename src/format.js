@@ -120,19 +120,31 @@ export function markdownToTelegram(markdown) {
     // A parser failure must never stop delivery; send text literally instead.
     return { text: String(markdown ?? "").slice(0, 50_000).trim(), entities: [] };
   }
-  text = text.trimEnd();
-  const end = text.length;
-  // Telegram does not allow styles overlapping code/pre. Also remove identical
-  // and redundant nested entities of the same type.
+  // Strip layout whitespace, never whitespace belonging to a final code span.
+  // In particular, trailing spaces and blank lines in code must survive.
+  const codeEnd = Math.max(0, ...entities.filter((e) => e.type === "pre" || e.type === "code").map((e) => e.offset + e.length));
+  const end = Math.max(text.trimEnd().length, codeEnd);
+  text = text.slice(0, end);
   const sorted = entities.filter((e) => e.offset < end).map((e) => ({
     ...e, length: Math.min(e.length, end - e.offset),
   })).filter((e) => e.length > 0).sort((a, b) => a.offset - b.offset || b.length - a.length);
   const code = sorted.filter((e) => e.type === "pre" || e.type === "code");
+  // Telegram cannot nest other styles inside code. Keep the styled fragments
+  // before and after each code span instead of dropping the whole style.
+  const pieces = sorted.flatMap((e) => {
+    if (e.type === "pre" || e.type === "code") return [e];
+    let ranges = [[e.offset, e.offset + e.length]];
+    for (const c of code) {
+      const right = c.offset + c.length;
+      ranges = ranges.flatMap(([a, b]) => {
+        if (b <= c.offset || a >= right) return [[a, b]];
+        return [[a, Math.min(b, c.offset)], [Math.max(a, right), b]].filter(([left, end]) => end > left);
+      });
+    }
+    return ranges.filter(([a, b]) => text.slice(a, b).trim()).map(([a, b]) => ({ ...e, offset: a, length: b - a }));
+  }).sort((a, b) => a.offset - b.offset || b.length - a.length);
   const valid = [];
-  for (const e of sorted) {
-    const overlapCode = e.type !== "pre" && e.type !== "code" && code.some((c) =>
-      e.offset < c.offset + c.length && c.offset < e.offset + e.length);
-    if (overlapCode) continue;
+  for (const e of pieces) {
     if (valid.some((v) => v.type === e.type && v.offset <= e.offset && v.offset + v.length >= e.offset + e.length)) continue;
     valid.push(e);
   }
@@ -165,6 +177,13 @@ export function splitTelegramMessage(formatted) {
       const nl = text.lastIndexOf("\n", end - 1);
       // Do not consume extra messages for a tiny last chunk near the cap.
       if (nl >= start + Math.floor(MAX_PART * 0.75) && text.length - (nl + 1) <= (MAX_PARTS - parts.length - 1) * MAX_PART) end = nl + 1;
+      const crossing = entities.find((e) => e.type === "pre" && e.length <= MAX_PART && e.offset < end && e.offset + e.length > end);
+      if (crossing) {
+        const codeEnd = crossing.offset + crossing.length;
+        if (codeEnd <= start + MAX_PART) end = codeEnd;
+        else if (crossing.offset > start && text.slice(start, crossing.offset).trim() &&
+          text.length - crossing.offset <= (MAX_PARTS - parts.length - 1) * MAX_PART) end = crossing.offset;
+      }
     }
     const segment = text.slice(start, end);
     const localEntities = entities.flatMap((entity) => {

@@ -5,10 +5,10 @@ import { ALICE, BOB, makeHarness, makeStorage } from "./harness.js";
 
 async function consent(h, user = ALICE, start = 1) {
   await h.send(h.message(user, "/start", start));
-  await h.send(h.callback(user, "consent:yes", start + 1));
+  await h.send(h.message(user, "✅ Согласен(на), начать", start + 1));
 }
 function last(h) { return h.telegram().at(-1).body; }
-function confirmData(h) { return last(h).reply_markup.inline_keyboard[0][0].callback_data; }
+function confirmData(h) { return last(h).reply_markup.keyboard[0][0].text; }
 
 function oldChats(storage, withSummary = true) {
   storage.db.exec(`CREATE TABLE chats (
@@ -60,8 +60,8 @@ test("старые заметки находятся по запросу, спи
   assert.ok(context.includes("ЛЮМИНОС важная старая настройка"));
   await h.send(h.message(ALICE, "/memory", 3));
   assert.match(last(h).text, /страница 1\/4/);
-  const next = last(h).reply_markup.inline_keyboard[0].at(-1).callback_data;
-  await h.send(h.callback(ALICE, next, 4));
+  const next = last(h).reply_markup.keyboard[0].at(-1).text;
+  await h.send(h.message(ALICE, next, 4));
   assert.match(last(h).text, /страница 2\/4/);
   await h.send(h.message(ALICE, `/forget A${oldId}`, 5));
   assert.equal(obj.rows("SELECT COUNT(*) AS n FROM memory_notes WHERE id=?", oldId)[0].n, 0);
@@ -84,7 +84,7 @@ test("очистка удаляет заметки, FTS, старую сводк
   });
   await h.send(h.message(ALICE, "/clear", 5));
   const button = confirmData(h);
-  await h.send(h.callback(ALICE, button, 6));
+  await h.send(h.message(ALICE, button, 6));
   assert.equal(obj.rows("SELECT COUNT(*) AS n FROM messages")[0].n, 0);
   assert.equal(obj.rows("SELECT COUNT(*) AS n FROM message_search")[0].n, 0);
   assert.equal(obj.rows("SELECT COUNT(*) AS n FROM memory_notes")[0].n, 0);
@@ -98,17 +98,17 @@ test("подтверждения одноразовые, истекают и с�
   await h.send(h.message(ALICE, "первая история", 3));
   await h.send(h.message(ALICE, "/clear", 4));
   const first = confirmData(h);
-  assert.match(first, /^confirm:[a-f0-9]{24}$/);
-  await h.send(h.callback(ALICE, first, 5));
+  assert.match(first, /^🗑 Очистить чат · [a-f0-9]{12}$/u);
+  await h.send(h.message(ALICE, first, 5));
   await h.send(h.message(ALICE, "новая история", 6));
-  await h.send(h.callback(ALICE, first, 7));
+  await h.send(h.message(ALICE, first, 7));
   assert.match(last(h).text, /устарела или уже использована/);
   await h.send(h.callback(ALICE, "clear:1", 8));
   assert.match(last(h).text, /больше не действует/);
   await h.send(h.message(ALICE, "/clear", 9));
   const expired = confirmData(h);
-  h.user().sql.exec("UPDATE confirmations SET expires_at=? WHERE token=?", Date.now() - 1000, expired.slice(8));
-  await h.send(h.callback(ALICE, expired, 10));
+  h.user().sql.exec("UPDATE confirmations SET expires_at=? WHERE substr(token,1,12)=?", Date.now() - 1000, expired.slice(-12));
+  await h.send(h.message(ALICE, expired, 10));
   assert.match(last(h).text, /устарела/);
   assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages")[0].n, 2);
 });
@@ -172,7 +172,7 @@ test("deleteall после занятого ИИ удаляет ожидающи
   await h.send(h.message(ALICE, "ДОЛГИЙ ВОПРОС", 4), { run: false });
   const inFlight = h.user().alarm();
   await started;
-  await h.send(h.callback(ALICE, confirm, 5), { run: false });
+  await h.send(h.message(ALICE, confirm, 5), { run: false });
   await h.send(h.message(ALICE, "ПОСЛЕ УДАЛЕНИЯ", 6), { run: false });
   release(); await inFlight; await h.drain();
   assert.equal(h.user().meta("consent"), undefined);
@@ -188,7 +188,7 @@ test("память другого пользователя не удаляетс
   h.user(ALICE).transaction(() => h.user(ALICE).addNote(1, "facts", "ФАКТ АЛИСЫ"));
   h.user(BOB).transaction(() => h.user(BOB).addNote(1, "facts", "ФАКТ БОБА"));
   await h.send(h.message(ALICE, "/deleteall", 5));
-  await h.send(h.callback(ALICE, confirmData(h), 6));
+  await h.send(h.message(ALICE, confirmData(h), 6));
   assert.equal(h.user(ALICE).rows("SELECT COUNT(*) AS n FROM memory_notes")[0].n, 0);
   assert.equal(h.user(ALICE).rows("SELECT COUNT(*) AS n FROM memory_search")[0].n, 0);
   assert.equal(h.user(BOB).rows("SELECT COUNT(*) AS n FROM memory_notes")[0].n, 1);

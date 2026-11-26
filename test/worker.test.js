@@ -5,7 +5,7 @@ import { ALICE, BOB, SECRET, TOKEN, makeHarness } from "./harness.js";
 
 async function consent(h, user = ALICE, start = 1) {
   await h.send(h.message(user, "/start", start));
-  await h.send(h.callback(user, "consent:yes", start + 1));
+  await h.send(h.message(user, "✅ Согласен(на), начать", start + 1));
 }
 function texts(h) { return h.telegram().map((c) => c.body.text); }
 function chatCalls(h) { return h.aiCalls.filter((call) => String(call.input.messages[0]?.content).includes("TeachingYou AI")); }
@@ -61,8 +61,9 @@ test("до согласия вопрос и file_id не сохраняются 
   await h.drain();
   assert.equal(h.aiCalls.length, 0);
   assert.match(texts(h)[0], /Перед началом/);
-  assert.match(texts(h)[0], /OpenRouter/);
-  assert.ok(h.telegram()[0].body.reply_markup.inline_keyboard[0][0].callback_data === "consent:yes");
+  assert.match(texts(h)[0], /внешним ИИ-сервисам/);
+  assert.doesNotMatch(texts(h)[0], /Cloudflare|OpenRouter|Z\.AI/);
+  assert.equal(h.telegram()[0].body.reply_markup.keyboard[0][0].text, "✅ Согласен(на), начать");
 });
 
 test("после согласия ответы форматируются и история передаётся в модель", async () => {
@@ -174,15 +175,15 @@ test("очистка и удаление работают только для в
   await h.send(h.message(ALICE, "Второй проект", 6));
   await h.send(h.message(ALICE, "/clear", 7));
   assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages WHERE chat_id=2")[0].n, 2);
-  const clear = h.telegram().at(-1).body.reply_markup.inline_keyboard[0][0].callback_data;
-  await h.send(h.callback(ALICE, clear, 8));
+  const clear = h.telegram().at(-1).body.reply_markup.keyboard[0][0].text;
+  await h.send(h.message(ALICE, clear, 8));
   assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages WHERE chat_id=2")[0].n, 0);
   assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages WHERE chat_id=1")[0].n, 2);
   assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM pins WHERE chat_id=1")[0].n, 1);
   await h.send(h.message(ALICE, "/chat 1", 9));
   await h.send(h.message(ALICE, "/delete", 10));
-  const remove = h.telegram().at(-1).body.reply_markup.inline_keyboard[0][0].callback_data;
-  await h.send(h.callback(ALICE, remove, 11));
+  const remove = h.telegram().at(-1).body.reply_markup.keyboard[0][0].text;
+  await h.send(h.message(ALICE, remove, 11));
   assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM messages WHERE chat_id=1")[0].n, 0);
   assert.equal(h.user().rows("SELECT COUNT(*) AS n FROM pins WHERE chat_id=1")[0].n, 0);
   assert.equal(h.user().chat(1), undefined);
@@ -193,8 +194,8 @@ test("deleteall стирает только данные пользовател�
   await h.send(h.message(ALICE, "Личная история A", 5));
   await h.send(h.message(BOB, "Личная история B", 6));
   await h.send(h.message(ALICE, "/deleteall", 7));
-  const confirm = h.telegram().at(-1).body.reply_markup.inline_keyboard[0][0].callback_data;
-  await h.send(h.callback(ALICE, confirm, 8));
+  const confirm = h.telegram().at(-1).body.reply_markup.keyboard[0][0].text;
+  await h.send(h.message(ALICE, confirm, 8));
   assert.equal(h.user(ALICE).rows("SELECT COUNT(*) AS n FROM messages")[0].n, 0);
   assert.equal(h.user(ALICE).rows("SELECT COUNT(*) AS n FROM message_search")[0].n, 0);
   assert.equal(h.user(ALICE).meta("consent"), undefined);
