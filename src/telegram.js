@@ -1,26 +1,16 @@
 import { formatReply } from "./format.js";
 import { isSafeBook } from "./books.js";
+import { buildReminderMessage } from "./reminders.js";
 import { abortAfter, readBytes, readJson } from "./net.js";
 
+// A short Telegram command list; the existing power-user commands continue to
+// work even when they are not registered in this visible list.
 export const BOT_COMMANDS = [
+  { command: "menu", description: "Разделы и кнопки" },
   { command: "new", description: "Создать новый чат" },
-  { command: "chats", description: "Открыть список чатов" },
-  { command: "chat", description: "Открыть чат по номеру" },
-  { command: "rename", description: "Переименовать текущий чат" },
-  { command: "search", description: "Найти информацию в интернете" },
-  { command: "book", description: "Найти книгу в PDF" },
-  { command: "mode", description: "Выбрать режим общения" },
-  { command: "memory", description: "Посмотреть память чата" },
-  { command: "remember", description: "Закрепить заметку" },
-  { command: "unpin", description: "Удалить закреплённую заметку" },
-  { command: "forget", description: "Удалить автоматическую заметку" },
-  { command: "clear", description: "Очистить историю и память чата" },
-  { command: "delete", description: "Удалить текущий чат" },
-  { command: "deleteall", description: "Удалить всё и отозвать согласие" },
-  { command: "privacy", description: "Как обрабатываются данные" },
-  { command: "help", description: "Помощь и команды" },
-  { command: "start", description: "Начать и обновить меню" },
-  { command: "agree", description: "Подтвердить согласие" },
+  { command: "chats", description: "Выбрать чат" },
+  { command: "remind", description: "Подготовить напоминание Telegram" },
+  { command: "help", description: "Как пользоваться ботом" },
 ];
 
 const TELEGRAM_TIMEOUT_MS = 8_000;
@@ -127,6 +117,25 @@ export function startTyping(fetchImpl, token, chatId, requestedAction = "typing"
       clearTimeout(guard);
     }
   };
+}
+
+// A date entity opens Telegram's own reminder UI; it does NOT schedule a bot
+// message. Never retry an ambiguous send: it may already have reached Telegram.
+export async function sendNativeReminder(fetchImpl, token, chatId, reminder, replyMarkup = undefined) {
+  let message;
+  try { message = buildReminderMessage(reminder?.text, reminder?.at); }
+  catch { return false; }
+  const body = { chat_id: chatId, ...message };
+  if (replyMarkup) body.reply_markup = replyMarkup;
+  const result = await telegramPost(fetchImpl, token, "sendMessage", body);
+  if (result.ok) return true;
+  if (result.status === 400 && /entit|parse|date/i.test(String(result.data?.description || ""))) {
+    const entity = message.entities[0];
+    const utc = message.text.slice(entity.offset, entity.offset + entity.length);
+    const fallback = `🔔 ${reminder.text.trim()}\n\n⏰ ${utc}\n\nTelegram не принял интерактивную дату: напоминание не создано. Открой «Избранное», напиши текст и выбери напоминание через меню кнопки отправки. Время выше указано в UTC: пересчитай его на свой часовой пояс.`;
+    return (await telegramPost(fetchImpl, token, "sendMessage", { chat_id: chatId, text: fallback, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) })).ok;
+  }
+  return false;
 }
 
 export async function sendReply(fetchImpl, token, chatId, markdown, replyMarkup = undefined) {

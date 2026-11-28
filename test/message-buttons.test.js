@@ -22,13 +22,16 @@ test("настоящий путь согласия через message-only webho
   const notice = last(h);
   assert.equal(notice.reply_markup.inline_keyboard, undefined);
   assert.match(notice.text, /Владелец бота может получить/);
-  assert.match(notice.text, /Сообщения и фото передаются внешним ИИ-сервисам/);
+  assert.match(notice.text, /Вопросы и фото передаются внешним ИИ-сервисам/);
   assert.match(notice.text, /Поисковые запросы/);
+  assert.match(notice.text, /Часовой пояс хранится у бота/);
+  assert.match(notice.text, /Напоминание создаётся после подтверждения/);
+  assert.match(notice.text, /напоминание удаляется в «Избранном»/);
   assert.match(notice.text, /\/clear/);
   assert.match(notice.text, /\/deleteall/);
   assert.match(notice.text, /Копии/);
   assert.doesNotMatch(notice.text, /Cloudflare|OpenRouter|Z\.AI|SQLite/);
-  assert.ok(notice.text.length < 700);
+  assert.ok(notice.text.length < 800);
   assert.equal(h.aiCalls.length, 0);
 
   const choice = buttons(h)[0];

@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { BOT_COMMANDS, sendBook } from "../src/telegram.js";
 import { findBooks, isSafeBook, MAX_BOOK_BYTES } from "../src/books.js";
+import { UI } from "../src/menu.js";
 import { ALICE, BOB, makeHarness } from "./harness.js";
 
 const commonBook = {
@@ -43,9 +44,9 @@ function docs(h) { return h.calls.filter((c) => c.url.endsWith("/sendDocument"))
 function catalogs(h) { return h.calls.filter((c) => /(?:commons\.wikimedia\.org|archive\.org)/.test(c.url)); }
 function apiCalls(h, method) { return h.calls.filter((c) => c.url.endsWith(`/${method}`)); }
 
-const expectedCommands = ["start", "help", "agree", "new", "chats", "chat", "rename", "search", "book", "mode", "memory", "remember", "unpin", "forget", "clear", "delete", "deleteall", "privacy"];
+const expectedCommands = ["menu", "new", "chats", "remind", "help"];
 
-test("/start настраивает левое меню всех команд только для разрешённого личного чата", async () => {
+test("/start настраивает короткое левое меню только для разрешённого личного чата", async () => {
   const h = makeHarness();
   await h.send(h.message(ALICE, "/start", 1));
   const registrations = apiCalls(h, "setMyCommands"), menu = apiCalls(h, "setChatMenuButton");
@@ -151,6 +152,20 @@ test("по названию находятся варианты, выбранн�
   await h.send(h.message(ALICE, button, 5));
   assert.equal(docs(h).length, 1);
   assert.match(last(h).text, /устарел/);
+});
+
+test("после поиска PDF через раздел меню клавиатура с вариантами не скрывается", async () => {
+  const h = makeHarness({ networkImpl: catalogNetwork() }); await consent(h);
+  await h.send(h.message(ALICE, "/menu", 3));
+  await h.send(h.message(ALICE, UI.search, 4));
+  await h.send(h.message(ALICE, UI.book, 5));
+  await h.send(h.message(ALICE, "Война и мир", 6));
+  assert.match(last(h).text, /Нашёл варианты PDF/);
+  const button = labels(h).find((label) => /^📖 PDF 1/.test(label));
+  assert.ok(button);
+  assert.equal(h.aiCalls.length, 0);
+  await h.send(h.message(ALICE, button, 7));
+  assert.equal(docs(h).length, 1);
 });
 
 test("обычная просьба прислать книгу в PDF тоже запускает каталоги без ИИ", async () => {
